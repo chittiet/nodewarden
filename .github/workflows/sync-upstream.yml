@@ -1,0 +1,83 @@
+name: Sync upstream weekly
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+
+env:
+  UPSTREAM_REPO: "shuaiplus/nodewarden"
+  UPSTREAM_BRANCH: "main"
+  TARGET_BRANCH: "main"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || true
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Record pre-merge commit
+        id: before
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt merge from upstream
+        id: merge
+        run: |
+          set +e
+          git merge --no-edit "upstream/${{ env.UPSTREAM_BRANCH }}"
+          echo "merge_status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Push if merge succeeded and changed
+        if: steps.merge.outputs.merge_status == '0'
+        run: |
+          AFTER_SHA=$(git rev-parse HEAD)
+          if [ "$AFTER_SHA" != "${{ steps.before.outputs.sha }}" ]; then
+            git push origin "${{ env.TARGET_BRANCH }}"
+          else
+            echo "No changes to push."
+          fi
+
+      - name: Abort merge if conflict occurred
+        if: steps.merge.outputs.merge_status != '0'
+        run: git merge --abort
+
+      - name: Recreate conflicted merge for manual resolution
+        if: steps.merge.outputs.merge_status != '0'
+        run: |
+          BRANCH_NAME="sync-upstream-$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
+          git checkout -b "$BRANCH_NAME"
+          git merge --no-edit "upstream/${{ env.UPSTREAM_BRANCH }}" || true
+          git add -A
+          git commit -m "Sync upstream/${{ env.UPSTREAM_BRANCH }} with unresolved conflicts"
+          git push origin "$BRANCH_NAME"
+
+      - name: Create pull request for manual merge
+        if: steps.merge.outputs.merge_status != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Sync upstream/${{ env.UPSTREAM_BRANCH }} - manual merge required" \
+            --body "Automatic merge failed due to a conflict with a locally modified file. This branch contains the merge with unresolved conflict markers left in place. Please review and resolve the conflicts in this PR before merging into \`${{ env.TARGET_BRANCH }}\`." \
+            --base "${{ env.TARGET_BRANCH }}" \
+            --head "$BRANCH_NAME"
